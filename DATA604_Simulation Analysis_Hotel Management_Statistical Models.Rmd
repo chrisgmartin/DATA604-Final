@@ -1,0 +1,447 @@
+---
+title: "Simulation Analysis: Hotel Management and Efficient Staffing Models"
+author: "Chris G Martin"
+date: "December 4, 2017"
+output:
+  html_document:
+    fig_caption: yes
+    force_captions: yes
+    highlight: pygments
+    number_sections: no
+    theme: united
+    toc: true
+  pdf_document:
+    fig_caption: yes
+    highlight: pygments
+    latex_engine: xelatex
+    number_sections: no
+fontsize: 11pt
+---
+
+# Set-Up
+
+```{r}
+#create reproducability
+set.seed(123)
+```
+
+# Verification and Validation
+
+As mentioned in the project document: One method of verification is to calculate the minimum and maximum expected profits to ensure that our realized profits fall within the range; if our results fall outside of the range then there is an issue somewhere in the model that needs to be fixed.
+
+In this calculation, the reason functions are used is that I want to make sure this model is flexible enough to change key parameters if needed, while at the same time tracing each of the inputs in a distinct and clear manner. It takes more time to set-up, and may cause simulation runs to take more time, but it is easier to read and easier to adjust.
+
+## Estimating Revenues
+
+```{r}
+#walk rate (distance) is estimated at 1 min, which is different from our model but simple enough for this purpose
+#distance is multiplied by two to indicate the time to go to the room and from the room
+#space is built in break between entries
+revenue <- function(hours=24, stdrooms=25, prerooms=7, stdprice=150, preprice=250, roomhours=6, distance=1/60, cleantime=5/60, space=0){
+  occupancyrate <- hours/(roomhours + distance*2 + cleantime + space)
+  stdrev <- occupancyrate * stdrooms * stdprice
+  prerev <- occupancyrate * prerooms * preprice
+  revenue <- stdrev + prerev
+}
+
+#maximum revenue is an ideal scenario in which rooms are filled at the start with full duration (5 hours) remaining, and no space between entries.
+maxrev <- revenue()
+maxrev
+
+minrev <- revenue(roomhours=10, cleantime=28/60, space=28/60)
+minrev
+```
+
+## Calculating Expenses
+
+To estimate expenses, we add up the cost per room and the salary per employee (who are based on an hourly rate). Also, since each type of employee works in shifts (three shifts per day of 8 hours each and no breaks), these shifts need to be taken into account.
+
+```{r}
+#mshift = number of maids on the shift
+#rshift = number of receptionists on shift
+#pshfit = number of porters on shfit
+#hours/3 indicates 3 shifts
+expenses <- function(hours=24, fixedrooms=425, stdrooms=25, prerooms=7, mrate=10.16, mshift1=1, mshift2=1, mshift3=1, rrate=10.55, rshift1=2, rshift2=3, rshift3=3, prate=10.74, pshift1=1, pshift2=1, pshift3=1){
+  rooms <- fixedrooms*stdrooms + fixedrooms*prerooms
+  maids <- hours/3*mrate*mshift1 + hours/3*mrate*mshift2 + hours/3*mrate*mshift3
+  receptionists <- hours/3*rrate*rshift1 + hours/3*rrate*rshift2 + hours/3*rrate*rshift3
+  porters <- hours/3*prate*pshift1 + hours/3*prate*pshift2 + hours/3*prate*pshift3
+  expenses <- rooms + maids + receptionists + porters
+}
+
+fullexpenses <- expenses()
+fullexpenses
+```
+
+## Profit Esimtates
+
+With our estimated revenues and estimated costs, we simply subtract expenses from revenues and get our maximum and minimum estimates for profit.
+
+```{r}
+maxrev - fullexpenses
+minrev - fullexpenses
+```
+
+
+# Statistical Models
+
+In this section, we will use statistical models to gather insights into how our system works. The prime reason for performing this type analysis, at least in the context of the project, is for verification and validation of our simulation model, howewver the statistical model is also useful in the beginning stages as it gives insights in creating the model that may not have otherwise have been seen. In this case, let's see what we'll uncover:
+
+## CRAN Packages
+
+This section will involve a lot of calculation and load, so the [queueing](https://cran.r-project.org/web/packages/queueing/queueing.pdf) package will be tested out to try to reduce the amount of work I have to do manually typing out these calculations. Similarly, the [triangle](https://cran.r-project.org/web/packages/triangle/triangle.pdf) package will be used for random triangular variables.
+
+```{r}
+#install.packages('queueing')
+library(queueing)
+#install.packages('triangle')
+library(triangle)
+```
+
+## Model Inputs
+
+As mentioned in the documentation, the distribution of various inputs will be randomly generated. Here are estimates built into the model:
+
+Guests:
+
+- Incoming Guest Entry Times: Triangular, min=7, mode=15, max=28 (minutes)
+- Probability of Premium Guest: 10%
+- Guest Stay Durations: Uniform, min=6, max=10 (hours)
+
+Reception:
+
+- Reception Check-In: Triangular, min=4, mode=6, max=14 (minutes)
+- Reception Check-Out: 0 (minutes)
+
+Housekeeping:
+
+- Standard Room Cleaning Time: Triangular, min=5, mode=14.6, max=28 (minutes)
+- Premium Room Cleaning Time: Standard Rooms + 3 (minutes)
+
+Porters:
+
+- Porter speed: Lognormal, normal mean=0.927, normal standard deviation=0.264 (minutes)
+
+
+### Guests
+
+#### Incoming Guest Arrival Times / Probability of Premium Guests
+
+Since our simulation is 24 hours long, estimating the number of guests that will enter our system will be difficult. In addition, the number of guests that enter at once will have to be measured.
+
+
+```{r}
+#n=1000
+#random triangular
+#minimum 7 min, maximum 28 min, mode 15 min
+entrytimes <- rtriangle(1000, 7, 28, 15)
+#round entries to get whole people
+#random triangular
+#minimum 1 entry, maximum 3 entries, mode 2 entries
+entrycounts <- round(rtriangle(1000, 1, 3, 2),0)
+entryframe <- data.frame(entrytimes, entrycounts)
+#estimate of time per entry
+entryframe$entrytimeper <- entryframe$entrytimes / entryframe$entrycounts
+#estimate of entries per min
+entryframe$entryminper <- entryframe$entrycounts / entryframe$entrytimes
+#estimate of entries per min
+entryframe$entryper <- entryframe$entrycounts / entryframe$entrytimeper
+
+#entries per min
+initiallambda <- mean(entryframe$entryper)
+```
+
+We have estimated the number of entries at once into the system, and number of mintues between each entry, as well as the number of minutes per entry and entries per minute. Our estimate for entry rate is the average minute per entry `r initiallambda`.
+
+### Reception / Check-In
+
+After guests arrive, they immediately move to reception. Reception's task is process the guests and check them into a room. There are three receptionists in my model, and as such it's an M/M/3 queue.
+
+In English, the arrival times are random and the number of arrivals at one time are also random (the first M), the service time distribution is also random (the second M), and the number of servers (rooms) are fixed at 25. 
+
+For an M/M/c Queue, the steady-state parameters are defined as (with c being the number of channels, in our case 25):
+
+$\rho = \frac{\lambda}{c\mu}$
+
+$P_{0} = \left\{\begin{bmatrix}\displaystyle\sum_{n=0}^{c-1} \frac{(\lambda / \mu)^n}{n!}\end{bmatrix} \begin{bmatrix}(\frac{\lambda}{\mu})^c (\frac{1}{c!}) (\frac{c \mu}{c \mu - \lambda}) \end{bmatrix} \right\} = \left\{\begin{bmatrix}\displaystyle\sum_{n=0}^{c-1} \frac{(\lambda / \mu)^n}{n!}\end{bmatrix} \begin{bmatrix}(c \rho)^c(\frac{1}{1 - \rho}) \end{bmatrix}\right\}$
+
+$P(L(\infty) >= c) = \frac{(\lambda/\mu)^cP_{0}}{c!(1-\lambda/c\mu)} = \frac{(cp)^cP_{0}}{c!(1-\rho)}$
+
+$L = c\rho + \frac{(c\rho)^{c+1}P_{0}}{c(c!)(1-\rho)^2} = c\rho + \frac{\rho P(L(\infty) >= c)}{1-\rho}$
+
+$w = \frac{L}{\lambda}$
+
+$w_{Q} = w - \frac{1}{\mu}$
+
+$L_{Q} = \lambda w_{Q} = \frac{(c\rho)^{c+1}P_{0}}{c(c!)(1-\rho)^2} = c\rho + \frac{\rho P(L(\infty) >= c)}{1 - \rho}$
+
+$L - L_{Q} = \frac{\lambda}{\mu} = c\rho$
+
+Where $\lambda$ is the arrival rate, $\mu$ is the service rate of the server (receptionist), $\rho$ is the utilization of the server (receptionist), L is the long-run time-average number of customers in the system (Q designates queue), w is the long-run average time spent in the system per customer (Q designates queue), $P_{0}$ as the steady-state probability of having 0 customers in the system, and where L($\infty$) is the varliable representing the number in the system in statistical equlibrium (e.g. after a very long time).
+
+We've previously estimated $\lambda$ and $\mu$, but need to tweak our calculation for $\rho$.
+
+```{r}
+#c is the number of receptionists
+c <- 3
+
+#average service time
+receptionservicetime <- round(rtriangle(1000, 4, 14, 6),0)
+receptionmu <- mean(receptionservicetime)
+
+rho <- initiallambda / (c * receptionmu)
+```
+
+As we can see, $\rho$ = `r rho`. We have 3 servers and our model is based on a more dynamic entries function than 2 entries per every so mins. However, we can use this estimate to estimate other variables. Let's give the **queueing** package a try for this.
+
+```{r}
+reception <- NewInput.MMC(initiallambda, receptionmu, c=3, n=1000)
+CheckInput.i_MMC(reception)
+receptionMMC <- QueueingModel.i_MMC(reception)
+receptionsummary <- summary(receptionMMC)
+summary(receptionMMC)
+```
+
+These results show that the probability of all servers being busy is `r receptionsummary$el[7]`.
+
+### Escort In / Porters 1
+
+Porters escort guests from the reception to the guest room. In this statistical model we're removing the differences between standard rooms and premium rooms for the moment, as the distance is the same reguardless. Porters take a random lognormal avverage speed of 0.927 minutes to escort, with a standard deviation of 0.264 minutes. The **rlnorm** function will generate random samples.
+
+```{r}
+porterspeed1 <- rlnorm(1000, meanlog=0.927, sdlog=0.264)
+portermu1 <- mean(porterspeed1)
+
+porter1 <- NewInput.MMC(lambda=initiallambda, mu=portermu1, c=1, n=1000, method=1)
+CheckInput.i_MMC(porter1)
+porter1MMC <- QueueingModel.i_MMC(porter1)
+porter1summary <- summary(porter1MMC)
+summary(porter1MMC)
+```
+
+#### Guest Stay Duration
+
+As a uniform distribution, the probability density function (pdf) is defined as:
+
+\[ f(x) =
+\begin{cases}
+\frac{1}{b-a} & \quad \text{if a < x < b}\\
+0 & \quad \text{otherwise}
+\end{cases}
+\]
+
+This estimation can be completed with the **runif** statement in R, so in this case we estimate guest stay duration:
+
+```{r}
+#n = 1000
+#stays are in hours, multiplied by 60 for mins
+#random uniform
+#min 6 hours, max 10 hours
+stayduration <- runif(1000, min=6*60, max=10*60)
+```
+
+Stay duration feeds into our estimate for $\mu$ at this server which is used during our room stays below.
+
+
+### Standard Rooms
+
+Server utilization, in this particular model, is a $M^x$/M/25 queue for standard rooms, where **x** is triangularly random. As mentioned in the previous section on guest stay durations, our estimate of $\mu$ feeds right into this process. In addition, we keep the same estimate for arrivals as $\lambda$ since we don't need to change that.
+
+```{r}
+roommu <- mean(stayduration)
+
+stdrooms <- NewInput.MMC(lambda=initiallambda, mu=roommu, c=25, n=1000, method=1)
+CheckInput.i_MMC(stdrooms)
+stdroomsMMC <- QueueingModel.i_MMC(stdrooms)
+stdroomssummary <- summary(stdroomsMMC)
+summary(stdroomsMMC)
+```
+
+### Premium Rooms
+
+Premium rooms work similar to standard rooms, except there are far fewer servers.
+
+```{r}
+premrooms <- NewInput.MMC(initiallambda, roommu, c=7, n=1000)
+CheckInput.i_MMC(premrooms)
+premroomsMMC <- QueueingModel.i_MMC(premrooms)
+premroomssummary <- summary(premroomsMMC)
+summary(premroomsMMC)
+```
+
+### Check Out / Porters 2
+
+Porters serve the second function of escorting guests from the room to the exit, and use the same speed as entry.
+
+```{r}
+porterspeed2 <- rlnorm(1000, meanlog=0.927, sdlog=0.264)
+portermu2 <- mean(porterspeed2)
+
+porter2 <- NewInput.MMC(lambda=initiallambda, mu=portermu2, c=1, n=1000, method=1)
+CheckInput.i_MMC(porter2)
+porter2MMC <- QueueingModel.i_MMC(porter2)
+porter2summary <- summary(porter2MMC)
+summary(porter2MMC)
+```
+
+Taking Porter 1 and Porter 2 combined will provide the porter utilization.
+
+### Housekeeping
+
+Finally, housekeeping will clean rooms after guests check-out. We have three cleaners, and their work re-opens the rooms as a server. Room cleaning times for standard rooms are set to be random traingular with a minimum of 5 minutes, a maximum of 14.6 minutes, and the mode of 28 minutes. Premimum rooms have the same distribution but take 3 minutes more.
+
+The issue with lambda is that it is incredibly difficult to estimate at this stage. By re-using the existing lambda estimate, a logical case could be made that entries into the system don't change, they still enter. Yes, by the point that guests check-out, the distribution changes. But, the random-ness of the entries at the start are still random so lambda should be OK.
+
+```{r}
+#15 percent of rooms are premium rooms
+housekeepingtimes <- c(rtriangle(1000*0.85, 7, 28, 15), rtriangle(1000*0.15, 10, 31, 18))
+housekeepermu <- mean(housekeepingtimes)
+
+housekeeping <- NewInput.MMC(initiallambda, housekeepermu, c=3, n=1000)
+CheckInput.i_MMC(housekeeping)
+housekeepingMMC <- QueueingModel.i_MMC(housekeeping)
+housekeepingsummary <- summary(housekeepingMMC)
+summary(housekeepingMMC)
+```
+
+## Estimating Revenues
+
+With the utilizations measured, we can attempt to use our knowledge of the model to estimate revenues by counting the number of guests that enter 
+
+```{r}
+#limiting to 100 based on the simulation models since they did not reach more than 100 guests
+#this seems appropriate estimate since most rows contain more than one guest per entry
+
+revenueframe <- data.frame('guest'=c(1), 'entry'=c(entryframe[1,1]), 'checkintime'=c(receptionservicetime[1]), 'portertime1'=c(porterspeed1[1]), 'roomtime'=c(stayduration[1]), 'portertime2'=c(porterspeed2[1]), 'housekeeping'=c(housekeepingtimes[1]))
+
+i <- 2
+while (i<100) {
+  if (entryframe[i,2]==1) {
+    revenueframe[i,1] <- i
+    revenueframe[i,2] <- entryframe[i,1]
+    #revenueframe$currtime[i] <- revenueframe$entrytime[i-1]
+    #revenueframe$entrytime[i] <- revenueframe$currtime[i] + entryframe$entrytimes[i]
+    revenueframe[i,3] <- receptionservicetime[i]
+    revenueframe[i,4] <- porterspeed1[i]
+    revenueframe[i,5] <- stayduration[i]
+    revenueframe[i,6] <- porterspeed2[i]
+    revenueframe[i,7] <- housekeepingtimes[i]
+    #revenueframe$checkouttime[i] <- revenueframe$entrytime[i] + revenueframe$checkintime[i] + revenueframe$portertime1[i] + revenueframe$roomtime[i] + revenueframe$portertime2[i]
+    i <- i + 1
+  }
+  else if (entryframe[i,2]==2) {
+    revenueframe[i,1] <- i
+    revenueframe[i,2] <- entryframe[i,1]
+    #revenueframe$currtime[i] <- revenueframe$entrytime[i-1]
+    #revenueframe$entrytime[i] <- revenueframe$currtime[i] + entryframe$entrytimes[i]
+    revenueframe[i,3] <- receptionservicetime[i]
+    revenueframe[i,4] <- porterspeed1[i]
+    revenueframe[i,5] <- stayduration[i]
+    revenueframe[i,6] <- porterspeed2[i]
+    revenueframe[i,7] <- housekeepingtimes[i]
+    #revenueframe$checkouttime[i] <- revenueframe$entrytime[i] + revenueframe$checkintime[i] + revenueframe$portertime1[i] + revenueframe$roomtime[i] + revenueframe$portertime2[i]
+      
+    #Next Row
+    revenueframe[i+1,1] <- i+1
+    revenueframe[i+1,2] <- entryframe[i,1]
+    #revenueframe$currtime[i+1] <- revenueframe$entrytime[i-1]
+    #$entrytime[i+1] <- revenueframe$currtime[i] + entryframe$entrytimes[i]
+    revenueframe[i+1,3] <- receptionservicetime[i]
+    revenueframe[i+1,4] <- porterspeed1[i]
+    revenueframe[i+1,5] <- stayduration[i]
+    revenueframe[i+1,6] <- porterspeed2[i]
+    revenueframe[i+1,7] <- housekeepingtimes[i]
+    #revenueframe$checkouttime[i+1] <- revenueframe$entrytime[i] + revenueframe$checkintime[i] + revenueframe$portertime1[i] + revenueframe$roomtime[i] + revenueframe$portertime2[i]
+    i <- i + 2
+  }
+  else
+    revenueframe[i,1] <- i
+    revenueframe[i,2] <- entryframe[i,1]
+    #revenueframe$currtime[i] <- revenueframe$entrytime[i-1]
+    #revenueframe$entrytime[i] <- revenueframe$currtime[i] + entryframe$entrytimes[i]
+    revenueframe[i,3] <- receptionservicetime[i]
+    revenueframe[i,4] <- porterspeed1[i]
+    revenueframe[i,5] <- stayduration[i]
+    revenueframe[i,6] <- porterspeed2[i]
+    revenueframe[i,7] <- housekeepingtimes[i]
+    #revenueframe$checkouttime[i] <- revenueframe$entrytime[i] + revenueframe$checkintime[i] + revenueframe$portertime1[i] + revenueframe$roomtime[i] + revenueframe$portertime2[i]
+      
+    #Next Row
+    revenueframe[i+1,1] <- i+1
+    revenueframe[i+1,2] <- entryframe[i,1]
+    #revenueframe$currtime[i+1] <- revenueframe$entrytime[i-1]
+    #revenueframe$entrytime[i+1] <- revenueframe$currtime[i] + entryframe$entrytimes[i]
+    revenueframe[i+1,3] <- receptionservicetime[i]
+    revenueframe[i+1,4] <- porterspeed1[i]
+    revenueframe[i+1,5] <- stayduration[i]
+    revenueframe[i+1,6] <- porterspeed2[i]
+    revenueframe[i+1,7] <- housekeepingtimes[i]
+    #revenueframe$checkouttime[i+1] <- revenueframe$entrytime[i] + revenueframe$checkintime[i] + revenueframe$portertime1[i] + revenueframe$roomtime[i] + revenueframe$portertime2[i]   
+      
+    #Row Three
+    revenueframe[i+2,1] <- i+2
+    revenueframe[i+2,2] <- entryframe[i,1]
+    #revenueframe$currtime[i+2] <- revenueframe$entrytime[i-1]
+    #revenueframe$entrytime[i+2] <- revenueframe$currtime[i] + entryframe$entrytimes[i]
+    revenueframe[i+2,3] <- receptionservicetime[i]
+    revenueframe[i+2,4] <- porterspeed1[i]
+    revenueframe[i+2,5] <- stayduration[i]
+    revenueframe[i+2,6] <- porterspeed2[i]
+    revenueframe[i+2,7] <- housekeepingtimes[i]
+    #revenueframe$checkouttime[i+2] <- revenueframe$entrytime[i] + revenueframe$checkintime[i] + revenueframe$portertime1[i] + revenueframe$roomtime[i] + revenueframe$portertime2[i]   
+    i <- i + 3
+}
+```
+
+With our data frame built and our information gathered together
+
+```{r}
+
+#add new columns
+revenueframe$entrytime <- c(0)
+revenueframe$currtime <- c(0)
+revenueframe$checkouttime <- c(0)
+
+revenueframe2 <- revenueframe
+```
+
+21.39785
+
+```{r}
+identical(revenueframe[2,2], revenueframe[3,2])
+
+i <- 2
+while (i < 102) {
+  if (identical(revenueframe[i-1,2], revenueframe[i,2])) {
+    revenueframe[i,8] <- revenueframe[i-1,8]
+    revenueframe[i,9] <- revenueframe[i-1,9]
+    i <- i+1
+  }
+  else
+    revenueframe[i,8] <- revenueframe[i-1,8] + revenueframe[i,2]
+    revenueframe[i,9] <- revenueframe[i-1,9] + revenueframe[i-1,2]
+    i <- i+1
+}
+```
+
+```{r}
+i <- 1
+while (i < 101){
+  revenueframe[i,10] <- revenueframe[i,3] + revenueframe[i,4] + revenueframe[i,5] + revenueframe[i,6] + revenueframe[i,7] + revenueframe[i,9]
+  i <- i+1
+}
+```
+
+Since there are 1440 minutes in the model (24 hours * 60 minutes), our cutoff for new entries and exits is 1440 minutes. It just so happens that 100 guests in our model are at this cutoff point. At \$150 for standard guests and \$250 for premium guests, and a rate of 15% estimated to be premium guests, we can estimate our revenues at 100 guests: 
+
+```{r}
+statrevs <- 100*0.85*150 + 100*0.15*250
+```
+
+Our model gives us a revenue estimate of `r statrevs`. Expenses don't change, so we'll keep those assumptions of `r fullexpenses`.
+
+```{r}
+statprofits <- statrevs - fullexpenses
+```
+
+Our final profit estimation is `r statprofits`.
